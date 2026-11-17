@@ -1048,15 +1048,23 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)
         spec_config = vllm_config.speculative_config
-        if spec_config is not None and spec_config.method not in {
-            "mtp",
-            "ngram",
-            "ngram_gpu",
-        }:
-            raise NotImplementedError(
-                "Qwen4Exp speculative decoding supports only its native MTP "
-                "checkpoint and linear n-gram proposers"
-            )
+        if spec_config is not None:
+            if spec_config.method not in {
+                "mtp",
+                "ngram",
+                "ngram_gpu",
+                "dflash",
+                "dspark",
+            }:
+                raise NotImplementedError(
+                    "Qwen4Exp speculative decoding supports native MTP, linear "
+                    "n-gram proposers, and DFlash/DSpark drafters"
+                )
+            if getattr(spec_config, "enable_adaptive_verification", False):
+                raise ValueError(
+                    "Adaptive verification is not supported for Qwen4Exp; pass "
+                    "enable_adaptive_verification=False."
+                )
 
 
 class Qwen4ExpForCausalLMConfig(Qwen4ExpForConditionalGenerationConfig):

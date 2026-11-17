@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen4Exp model."""
 
+from bisect import bisect_left
 from collections.abc import Iterable
 from itertools import islice
 
@@ -33,10 +34,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsHCSP,
     SupportsLoRA,
     SupportsMRoPE,
@@ -201,6 +204,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.use_sequence_parallel = (
             vllm_config.parallel_config.use_sequence_parallel_moe
         )
+        self.capture_aux_hidden_state = False
         self.ple: Qwen4ExpPLELayer | None = None
         ple_layer_ids = config.ple_layer_ids
         if (self.layer_idx + 1) in ple_layer_ids:
@@ -313,6 +317,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if self.use_hc_sequence_parallel:
             # Positions retain the full token axis for both text and MRoPE inputs.
             block_input = sp_all_gather(block_input)[: positions.shape[-1]]
+        aux_hidden_state = block_input if self.capture_aux_hidden_state else None
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
         elif self.layer_type in _QSA_LAYER_TYPES:
@@ -343,6 +348,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 mlp_out = (
                     sp_reduce_scatter(mlp_out) if reduce_output else sp_shard(mlp_out)
                 )
+        if aux_hidden_state is not None:
+            return hidden_states, mlp_out, injection, aux_hidden_state
         return hidden_states, mlp_out, injection
 
 
@@ -407,7 +414,8 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         "deepstack_input_embeds": 0,
     }
 )
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -487,6 +495,44 @@ class Qwen4ExpModel(nn.Module):
         else:
             self._mtp_hidden_buffer = None
 
+    def _cache_aux_pp_layout(self) -> None:
+        from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+        if not model_parallel_is_initialized():
+            return
+        pp = get_pp_group()
+        if pp.world_size < 2 or pp.is_first_rank:
+            return
+        # Qwen4Exp captures layer L's contracted input on the stage owning L.
+        self._aux_slot_base_cached = bisect_left(
+            self.aux_hidden_state_layers, self.start_layer
+        )
+
+    def aux_hidden_state_slot_keys(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        pp = get_pp_group()
+        if pp.world_size < 2:
+            return (), ()
+        base = self._aux_slot_base_cached
+        end = (
+            base
+            if pp.is_last_rank
+            else bisect_left(self.aux_hidden_state_layers, self.end_layer)
+        )
+        key = self.AUX_HIDDEN_STATE_KEY
+        return (
+            tuple(f"{key}{i}" for i in range(base)),
+            tuple(f"{key}{i}" for i in range(base, end)),
+        )
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if any(layer < 0 or layer > self.config.num_hidden_layers for layer in layers):
+            raise ValueError("Qwen4Exp auxiliary layers must be valid layer indices")
+        super()._set_aux_hidden_state_layers(layers)
+        for layer_idx in range(self.start_layer, self.end_layer):
+            self.layers[layer_idx].capture_aux_hidden_state = (
+                layer_idx > 0 and layer_idx in self.aux_hidden_state_layers
+            )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -499,7 +545,8 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        aux_hidden_states: list[torch.Tensor] = []
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -507,6 +554,9 @@ class Qwen4ExpModel(nn.Module):
                 if input_ids is None:
                     raise ValueError("input_ids or inputs_embeds is required")
                 hidden_states = self.embed_input_ids(input_ids)
+            # Aux layer 0 denotes the embedding output, before HC expansion.
+            if 0 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states)
             if self.use_hc_sequence_parallel:
                 # The MoE padding mask stays unsharded: under torch.compile its
                 # update would land only after the graph has run.
@@ -526,7 +576,7 @@ class Qwen4ExpModel(nn.Module):
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
             last_layer = layer
-            hidden_states, block_output, injection = layer(
+            layer_output = layer(
                 hidden_states=hidden_states,
                 prev_block_output=block_output,
                 prev_injection=injection,
@@ -535,6 +585,11 @@ class Qwen4ExpModel(nn.Module):
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
             )
+            if layer_idx > 0 and layer_idx in self.aux_hidden_state_layers:
+                hidden_states, block_output, injection, aux_hidden_state = layer_output
+                aux_hidden_states.append(aux_hidden_state)
+            else:
+                hidden_states, block_output, injection = layer_output
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
             ):
@@ -568,7 +623,12 @@ class Qwen4ExpModel(nn.Module):
                 hidden_states = last_layer.mlp_hyper_connection.combine(
                     hidden_states, block_output, injection
                 )
-            return IntermediateTensors({"hidden_states": hidden_states})
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
+            )
 
         # The final mixer consumes the last pending combine and returns both
         # the sampled single stream and the materialized multi-stream state.
@@ -601,6 +661,12 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        # A drafter tapping the last decoder layer reads the final HC
+        # contraction, which has no following attention layer to capture it.
+        if self.config.num_hidden_layers in self.aux_hidden_state_layers:
+            aux_hidden_states.append(sample_hidden_states)
+        if aux_hidden_states:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -651,6 +717,7 @@ class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
     SupportsHCSP,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -721,6 +788,13 @@ class Qwen4ExpForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     @classmethod
     def get_ple_mamba_state_dtype_from_config(
@@ -1026,6 +1100,12 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.language_model.get_mtp_target_hidden_states()
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_default_aux_hidden_state_layers()
 
     def forward(
         self,
