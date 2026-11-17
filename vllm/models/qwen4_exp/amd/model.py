@@ -789,13 +789,6 @@ class Qwen4ExpForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.set_aux_hidden_state_layers(layers)
-
-    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        num_layers = len(self.model.layers)
-        return (2, num_layers // 2, num_layers - 3)
-
     @classmethod
     def get_ple_mamba_state_dtype_from_config(
         cls,
@@ -1100,12 +1093,6 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.language_model.get_mtp_target_hidden_states()
-
-    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.language_model.set_aux_hidden_state_layers(layers)
-
-    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        return self.language_model.get_eagle3_default_aux_hidden_state_layers()
 
     def forward(
         self,
